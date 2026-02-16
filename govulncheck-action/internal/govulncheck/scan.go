@@ -4,45 +4,56 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"os"
 
 	"github.com/codeready-toolchain/toolchain-cicd/govulncheck-action/internal/configuration"
 	"golang.org/x/vuln/scan"
 )
 
-func Scan(ctx context.Context, logger *log.Logger, scan ScanFunc, config configuration.Configuration, path string) ([]*Vulnerability, error) {
+func Scan(ctx context.Context, logger *slog.Logger, scan ScanFunc, path string, config configuration.Configuration) ([]*Vulnerability, []*configuration.Vulnerability, error) {
 	rawReport, err := scan(ctx, logger, path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// get the vulns from the report
 	vulns, err := getVulnerabilities(rawReport)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// remove ignored vulnerabilities
-	return pruneIgnoredVulns(logger, vulns, config.IgnoredVulnerabilities), nil
+	return pruneIgnoredVulns(logger, vulns, config.IgnoredVulnerabilities), listOutdatedVulns(vulns, config.IgnoredVulnerabilities), nil
 }
 
-type ScanFunc func(ctx context.Context, logger *log.Logger, path string) ([]byte, error)
+type ScanFunc func(ctx context.Context, logger *slog.Logger, path string) ([]byte, error)
 
-var DefaultScan ScanFunc = func(ctx context.Context, logger *log.Logger, path string) ([]byte, error) {
-	// check that the path exists
-	_, err := os.ReadDir(path)
-	if err != nil {
-		return nil, err
+func DefaultScan(stderr io.Writer) ScanFunc {
+	return func(ctx context.Context, logger *slog.Logger, path string) ([]byte, error) {
+		// check that the path exists
+		logger.Info("scanning for vulnerabilities", "path", path)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("invalid scan path '%s': %w", path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("path '%s' is not a directory: %w", path, err)
+		}
+		c := scan.Command(ctx, "-C", path, "-format", "json", "./...")
+		stdout := &bytes.Buffer{}
+		c.Stdout = stdout
+		c.Stderr = stderr
+		if err := c.Start(); err != nil {
+			return nil, fmt.Errorf("failed to start golang/govulncheck: %w", err)
+		}
+		if err := c.Wait(); err != nil {
+			fmt.Fprintf(stderr, "%s", stdout.String())
+			return nil, fmt.Errorf("failed while running golang/govulncheck: %w", err)
+		}
+		if logger.Enabled(ctx, slog.LevelDebug) {
+			logger.Debug("govulncheck output", "output", stdout.String())
+		}
+		return stdout.Bytes(), nil
 	}
-	c := scan.Command(ctx, "-C", path, "-format", "json", "./...")
-	out := &bytes.Buffer{}
-	c.Stdout = out
-	c.Stderr = logger.Writer()
-	if err := c.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start golang/govulncheck: %w", err)
-	}
-	if err := c.Wait(); err != nil {
-		return nil, fmt.Errorf("failed while running golang/govulncheck: %w", err)
-	}
-	return out.Bytes(), nil
 }
